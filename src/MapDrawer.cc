@@ -26,7 +26,15 @@ namespace ORB_SLAM3
 {
 
 
-MapDrawer::MapDrawer(Atlas* pAtlas, const string &strSettingPath, Settings* settings):mpAtlas(pAtlas)
+MapDrawer::MapDrawer(Atlas* pAtlas, const string &strSettingPath, Settings* settings):
+    mpAtlas(pAtlas),    
+    m_octree(NULL),
+    m_maxRange(-1.0),
+    m_useHeightMap(true),
+    m_res(0.05),
+    m_colorFactor(0.8),
+    m_treeDepth(0),
+    m_maxTreeDepth(0)
 {
     if(settings){
         newParameterLoader(settings);
@@ -48,6 +56,16 @@ MapDrawer::MapDrawer(Atlas* pAtlas, const string &strSettingPath, Settings* sett
             }
         }
     }
+    m_octree = new octomap::ColorOcTree(m_res);
+    // initialize octomap
+    m_octree->setClampingThresMin(0.12);
+    m_octree->setClampingThresMax(0.97);
+    m_octree->setProbHit(0.7);
+    m_octree->setProbMiss(0.4);
+
+    m_treeDepth = m_octree->getTreeDepth();
+    m_maxTreeDepth = m_treeDepth;
+
 }
 
 void MapDrawer::newParameterLoader(Settings *settings) {
@@ -58,7 +76,472 @@ void MapDrawer::newParameterLoader(Settings *settings) {
     mCameraSize = settings->cameraSize();
     mCameraLineWidth  = settings->cameraLineWidth();
 }
+//Octomap
+void MapDrawer::LoadOctoMap()
+{
+    octomap::AbstractOcTree* tree = octomap::AbstractOcTree::read("octomap.ot");
+    m_octree= dynamic_cast<octomap::ColorOcTree*> (tree);
+}
 
+void MapDrawer::UpdateOctomap(vector<KeyFrame*> vKFs)
+{
+    int N = vKFs.size();
+    for ( size_t i=lastKeyframeSize; i<N ; i++ )
+    {
+         Eigen::Isometry3d pose = ORB_SLAM2::Converter::toSE3Quat( vKFs[i]->GetPose());
+
+         pcl::PointCloud<pcl::PointXYZRGB>  ground;
+         pcl::PointCloud<pcl::PointXYZRGB>  nonground;
+
+         GeneratePointCloud( vKFs[i], ground, nonground);
+         octomap::point3d sensorOrigin = octomap::point3d( pose(0,3), pose(1,3), pose(2,3));
+         InsertScan(sensorOrigin, ground, nonground);
+    }
+
+     lastKeyframeSize = N;
+}
+
+void MapDrawer::GeneratePointCloud(KeyFrame *kf, pcl::PointCloud<pcl::PointXYZRGB> &ground, pcl::PointCloud<pcl::PointXYZRGB> &nonground)
+{
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud (new pcl::PointCloud<pcl::PointXYZRGB>);
+    for ( int m=0; m<(kf->mImDep.rows); m+=1 )
+     {
+          for ( int n=0; n<(kf->mImDep.cols); n+=1 )
+          {
+              float d = kf->mImDep.ptr<float>(m)[n];///1000.0;
+              if (d < 0.01 || d>2.0)
+                 continue;
+              pcl::PointXYZRGB p;
+              p.z = d;
+              p.x = ( n - cx) * p.z / fx;
+              p.y = ( m - cy) * p.z / fy;
+              if(p.y<-3.0 || p.y>3.0) continue;
+              p.b = kf->mImRGB.ptr<uchar>(m)[n*3];
+              p.g = kf->mImRGB.ptr<uchar>(m)[n*3+1];
+              p.r = kf->mImRGB.ptr<uchar>(m)[n*3+2];
+              cloud->points.push_back( p );
+
+          }
+     }
+    pcl::VoxelGrid<pcl::PointXYZRGB>vg;
+    vg.setInputCloud(cloud);
+    vg.setLeafSize(0.01,0.01, 0.01);
+    vg.filter(*cloud);
+    //STEP2: transform camera to word
+    Eigen::Isometry3d T = ORB_SLAM2::Converter::toSE3Quat( kf->GetPose() );
+    pcl::PointCloud<pcl::PointXYZRGB> temp;
+    pcl::transformPointCloud( *cloud, temp, T.inverse().matrix());
+
+       // filter ground plane
+    if(temp.size()<50)
+    {
+        printf("pointcloud too small skip ground plane extraction\n;");
+        ground = temp;
+    }
+    else
+    {
+        pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
+        pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
+
+        pcl::SACSegmentation<pcl::PointCloud<pcl::PointXYZRGB>::PointType> seg;
+        seg.setOptimizeCoefficients(true);
+        seg.setModelType(pcl::SACMODEL_PERPENDICULAR_PLANE);
+        seg.setMethodType(pcl::SAC_RANSAC);
+        seg.setMaxIterations(200);
+        seg.setDistanceThreshold(0.04);
+        seg.setAxis(Eigen::Vector3f(0, 1 ,0));
+        seg.setEpsAngle(0.5);
+
+        pcl::PointCloud<pcl::PointXYZRGB> cloud_filtered(temp);
+        pcl::ExtractIndices<pcl::PointCloud<pcl::PointXYZRGB>::PointType> extract;
+        bool groundPlaneFound = false;
+        while(cloud_filtered.size()>10 && !groundPlaneFound)
+        {
+            seg.setInputCloud(cloud_filtered.makeShared());
+            seg.segment(*inliers, *coefficients);
+            if(inliers->indices.size()==0)
+            {
+                break;
+            }
+            extract.setInputCloud(cloud_filtered.makeShared());
+            extract.setIndices(inliers);
+            if (std::abs(coefficients->values.at(3)) >0.07)
+            {
+                printf("Ground plane found: %zu/%zu inliers. Coeff: %f %f %f %f", inliers->indices.size(),
+                                                                                  cloud_filtered.size(),
+                                                                                  coefficients->values.at(0),
+                                                                                  coefficients->values.at(1),
+                                                                                  coefficients->values.at(2),
+                                                                                  coefficients->values.at(3));
+                extract.setNegative (false);
+                extract.filter (ground);
+                // remove ground points from full pointcloud:
+                // workaround for PCL bug:
+                if(inliers->indices.size() != cloud_filtered.size())
+                {
+                  extract.setNegative(true);
+                  pcl::PointCloud<pcl::PointXYZRGB> cloud_out;
+                  extract.filter(cloud_out);
+                  nonground += cloud_out;
+                  cloud_filtered = cloud_out;
+                }
+
+                groundPlaneFound = true;
+            }
+            else
+            {
+                printf("Horizontal plane (not ground) found: %zu/%zu inliers. Coeff: %f %f %f %f", inliers->indices.size(),
+                                                                                                   cloud_filtered.size(),
+                                                                                                   coefficients->values.at(0),
+                                                                                                   coefficients->values.at(1),
+                                                                                                   coefficients->values.at(2),
+                                                                                                   coefficients->values.at(3));
+                pcl::PointCloud<pcl::PointXYZRGB> cloud_out;
+                extract.setNegative (false);
+                extract.filter(cloud_out);
+                nonground +=cloud_out;
+                if(inliers->indices.size() != cloud_filtered.size())
+                {
+                     extract.setNegative(true);
+                     cloud_out.points.clear();
+                     extract.filter(cloud_out);
+                     cloud_filtered = cloud_out;
+                 }
+                else
+                {
+                     cloud_filtered.points.clear();
+
+                }
+              }
+
+         }//while
+
+         if(!groundPlaneFound)
+         {
+             nonground = temp;
+         }
+    }
+}
+
+void MapDrawer::InsertScan(octomap::point3d sensorOrigin, pcl::PointCloud<pcl::PointXYZRGB> &ground, pcl::PointCloud<pcl::PointXYZRGB> &nonground)
+{
+
+    if(!m_octree->coordToKeyChecked(sensorOrigin, m_updateBBXMin)|| !m_octree->coordToKeyChecked(sensorOrigin, m_updateBBXMax))
+     {
+            printf("coulde not generate key for origin\n");
+     }
+     octomap::KeySet free_cells, occupied_cells;
+     for(auto p:ground.points)
+     {
+        octomap::point3d point(p.x, p.y, p.z);
+        // only clear space (ground points)
+        if(m_octree->computeRayKeys(sensorOrigin, point, m_keyRay))
+        {
+             free_cells.insert(m_keyRay.begin(), m_keyRay.end());
+             m_octree->averageNodeColor(p.x, p.y, p.z, p.r,p.g, p.b);
+        }
+        octomap::OcTreeKey endKey;
+        if(m_octree->coordToKeyChecked(point, endKey))
+        {
+              updateMinKey(endKey, m_updateBBXMin);
+              updateMaxKey(endKey, m_updateBBXMax);
+         }
+        else
+        {
+              printf("could not generator key for endpoint");
+        }
+     }
+
+      // all other points : free on ray, occupied on endpoings:
+     for(auto p:nonground.points)
+     {
+         octomap::point3d point(p.x, p.y, p.z);
+         //free cell
+         if(m_octree->computeRayKeys(sensorOrigin, point, m_keyRay))
+         {
+            // free_cells.insert(m_keyRay.begin(),m_keyRay.end());
+         }
+         //occupided endpoint
+         octomap::OcTreeKey key;
+         if(m_octree->coordToKeyChecked(point, key))
+         {
+             occupied_cells.insert(key);
+             updateMinKey(key, m_updateBBXMin);
+             updateMaxKey(key, m_updateBBXMax);
+             m_octree->averageNodeColor(p.x, p.y, p.z, p.r,p.g, p.b);
+         }
+
+     }pcl::PointCloud<pcl::PointXYZRGB>observation;
+     for(octomap::KeySet::iterator it = free_cells.begin(), end= free_cells.end(); it!=end; ++it)
+     {
+         if(occupied_cells.find(*it) == occupied_cells.end())
+         {
+             m_octree->updateNode(*it, false);
+         }
+     }
+
+     for(octomap::KeySet::iterator it = occupied_cells.begin(), end= occupied_cells.end(); it!=end; ++it)
+     {
+         m_octree->updateNode(*it, true);
+     }
+
+     m_octree->prune();
+}
+
+void MapDrawer::heightMapColor(double h, double& r, double &g, double& b)
+{
+
+    double s = 1.0;
+    double v = 1.0;
+
+    h -= floor(h);
+    h *= 6;
+
+    int i;
+    double m, n, f;
+
+    i = floor(h);
+    f = h - i;
+
+    if(!(i & 1))
+    {
+        f = 1 - f;
+    }
+    m = v * (1-s);
+    n = v * (1- s*f);
+
+    switch(i)
+    {
+        case 6:
+        case 0:
+            r = v; g = n; b = m;
+            break;
+        case 1:
+            r = n; g = v; b = m;
+            break;
+        case 2:
+            r = m; g = v; b = n;
+            break;
+        case 3:
+            r = m; g = n; b = v;
+            break;
+        case 4:
+            r = n; g = m; b = v;
+            break;
+        case 5:
+            r = v; g = m; b = n;
+            break;
+        default:
+            r = 1; g = 0.5; b = 0.5;
+         break;
+
+    }
+
+}
+
+void MapDrawer::SaveOctoMap(const char *filename)
+{
+    std::ofstream outfile(filename, std::ios_base::out | std::ios_base::binary);
+    if (outfile.is_open())
+    {
+        m_octree->write(outfile);
+        outfile.close();
+    }
+}
+
+void MapDrawer::DrawOctoMap()
+{
+    vector<KeyFrame*> vKFs= mpMap->GetAllKeyFrames();
+    int N = vKFs.size();
+
+    if(N==0)
+    {
+        m_octree->clear();
+        lastKeyframeSize = 0;
+        return;
+    }
+    if(bIsLocalization == false)
+    UpdateOctomap(vKFs);
+
+
+
+    octomap::ColorOcTree::tree_iterator it  = m_octree->begin_tree();
+    octomap::ColorOcTree::tree_iterator end = m_octree->end_tree();
+    int counter = 0;
+    double occ_thresh = 0.9;
+    int level = 16;
+    glClearColor(1.0f,1.0f,1.0f,1.0f);
+
+    glDisable(GL_LIGHTING);
+    glEnable (GL_BLEND);
+    ////DRAW OCTOMAP BEGIN//////
+    double stretch_factor = 128/(1 - occ_thresh); //occupancy range in which the displayed cubes can be
+    for(; it != end; ++counter, ++it)
+    {
+        if(level != it.getDepth())
+        {
+            continue;
+        }
+        double occ = it->getOccupancy();
+        if(occ < occ_thresh)
+        {
+            continue;
+        }
+
+        double minX, minY, minZ, maxX, maxY, maxZ;
+        m_octree->getMetricMin(minX, minY, minZ);
+        m_octree->getMetricMax(maxX, maxY, maxZ);
+
+       float halfsize = it.getSize()/2.0;
+       float x = it.getX();
+       float y = it.getY();
+       float z = it.getZ();
+       double h = ( std::min(std::max((y-minY)/(maxY-minY), 0.0), 1.0))*0.8;
+       double r, g, b;
+       heightMapColor(h, r,g,b);
+       glBegin(GL_TRIANGLES);
+       //Front
+       glColor3d(r, g, b);
+       glVertex3f(x-halfsize,y-halfsize,z-halfsize);// - - - 1
+       glVertex3f(x-halfsize,y+halfsize,z-halfsize);// - + - 2
+       glVertex3f(x+halfsize,y+halfsize,z-halfsize);// + + -3
+
+       glVertex3f(x-halfsize,y-halfsize,z-halfsize); // - - -
+       glVertex3f(x+halfsize,y+halfsize,z-halfsize); // + + -
+       glVertex3f(x+halfsize,y-halfsize,z-halfsize); // + - -4
+
+       //Back
+       glVertex3f(x-halfsize,y-halfsize,z+halfsize); // - - + 1
+       glVertex3f(x+halfsize,y-halfsize,z+halfsize); // + - + 2
+       glVertex3f(x+halfsize,y+halfsize,z+halfsize); // + + + 3
+
+       glVertex3f(x-halfsize,y-halfsize,z+halfsize); // - - +
+       glVertex3f(x+halfsize,y+halfsize,z+halfsize); // + + +
+       glVertex3f(x-halfsize,y+halfsize,z+halfsize); // - + + 4
+
+       //Left
+       glVertex3f(x-halfsize,y-halfsize,z-halfsize); // - - - 1
+       glVertex3f(x-halfsize,y-halfsize,z+halfsize); // - - + 2
+       glVertex3f(x-halfsize,y+halfsize,z+halfsize); // - + + 3
+
+       glVertex3f(x-halfsize,y-halfsize,z-halfsize); // - - -
+       glVertex3f(x-halfsize,y+halfsize,z+halfsize); // - + +
+       glVertex3f(x-halfsize,y+halfsize,z-halfsize); // - + - 4
+
+       //Right
+       glVertex3f(x+halfsize,y-halfsize,z-halfsize);
+       glVertex3f(x+halfsize,y+halfsize,z-halfsize);
+       glVertex3f(x+halfsize,y+halfsize,z+halfsize);
+
+       glVertex3f(x+halfsize,y-halfsize,z-halfsize);
+       glVertex3f(x+halfsize,y+halfsize,z+halfsize);
+       glVertex3f(x+halfsize,y-halfsize,z+halfsize);
+
+       //top
+       glVertex3f(x-halfsize,y-halfsize,z-halfsize);
+       glVertex3f(x+halfsize,y-halfsize,z-halfsize);
+       glVertex3f(x+halfsize,y-halfsize,z+halfsize);
+
+       glVertex3f(x-halfsize,y-halfsize,z-halfsize);
+       glVertex3f(x+halfsize,y-halfsize,z+halfsize);
+       glVertex3f(x-halfsize,y-halfsize,z+halfsize);
+
+       //bottom
+       glVertex3f(x-halfsize,y+halfsize,z-halfsize);
+       glVertex3f(x-halfsize,y+halfsize,z+halfsize);
+       glVertex3f(x+halfsize,y+halfsize,z+halfsize);
+
+       glVertex3f(x-halfsize,y+halfsize,z-halfsize);
+       glVertex3f(x+halfsize,y+halfsize,z+halfsize);
+       glVertex3f(x+halfsize,y+halfsize,z-halfsize);
+       glEnd();
+
+       glBegin(GL_LINES);
+       glColor3f(0,0,0);
+       //
+       glVertex3f(x-halfsize,y-halfsize,z-halfsize);// - - - 1
+       glVertex3f(x-halfsize,y+halfsize,z-halfsize);
+
+       glVertex3f(x-halfsize,y+halfsize,z-halfsize);// - + - 2
+       glVertex3f(x+halfsize,y+halfsize,z-halfsize);// + + -3
+
+       glVertex3f(x+halfsize,y+halfsize,z-halfsize);// + + -3
+       glVertex3f(x+halfsize,y-halfsize,z-halfsize); // + - -4
+
+       glVertex3f(x+halfsize,y-halfsize,z-halfsize); // + - -4
+       glVertex3f(x-halfsize,y-halfsize,z-halfsize);// - - - 1
+
+
+       // back
+
+       glVertex3f(x-halfsize,y-halfsize,z+halfsize); // - - + 1
+       glVertex3f(x+halfsize,y-halfsize,z+halfsize); // + - + 2
+
+       glVertex3f(x+halfsize,y-halfsize,z+halfsize); // + - + 2
+       glVertex3f(x+halfsize,y+halfsize,z+halfsize); // + + + 3
+
+       glVertex3f(x+halfsize,y+halfsize,z+halfsize); // + + + 3
+       glVertex3f(x-halfsize,y+halfsize,z+halfsize); // - + + 4
+
+       glVertex3f(x-halfsize,y+halfsize,z+halfsize); // - + + 4
+       glVertex3f(x-halfsize,y-halfsize,z+halfsize); // - - + 1
+
+       // top
+       glVertex3f(x+halfsize,y-halfsize,z-halfsize);
+       glVertex3f(x+halfsize,y-halfsize,z+halfsize);
+
+       glVertex3f(x-halfsize,y-halfsize,z+halfsize);
+       glVertex3f(x-halfsize,y-halfsize,z-halfsize);
+
+        // bottom
+
+       glVertex3f(x-halfsize,y+halfsize,z+halfsize);
+       glVertex3f(x+halfsize,y+halfsize,z+halfsize);
+
+       glVertex3f(x-halfsize,y+halfsize,z-halfsize);
+       glVertex3f(x+halfsize,y+halfsize,z-halfsize);
+       glEnd();
+    }
+}
+
+void MapDrawer::DrawGrid()
+{
+    glBegin(GL_LINES);
+    glLineWidth(1);
+
+    glColor3f(0.5,0.5,0.5); //gray
+    int size =10;
+    for(int i = -size; i <= size ; i++){
+
+      glVertex3f(i,0.6,  size);
+      glVertex3f(i, 0.6, -size);
+      glVertex3f( size, 0.6, i);
+      glVertex3f(-size, 0.6, i);
+    }
+
+    glEnd();
+}
+void MapDrawer::DrawObs(pcl::PointCloud<pcl::PointXYZRGB> observation)
+{
+    glPointSize(mPointSize);
+    glBegin(GL_POINTS);
+    glColor3f(1.0,0.0,0.0);
+
+    for(int i=0; i<observation.points.size(); i++)
+    {
+
+
+        glVertex3f(observation.points[i].x,observation.points[i].y,observation.points[i].z);
+
+    }
+
+    glEnd();
+}
+
+void MapDrawer::Register(Map* pMap) {
+  mpMap = pMap;
+}
+//Orbslam3
 bool MapDrawer::ParseViewerParamFile(cv::FileStorage &fSettings)
 {
     bool b_miss_params = false;
